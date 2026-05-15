@@ -427,10 +427,10 @@ def load_all_documents_sync() -> int:
     """
     global _registered_docs, _registered_raw, _registered_img
 
-    from remarkable_mcp.api import get_items_by_id, get_rmapi
+    from remarkable_mcp.api import get_items_by_id, get_meta_items_cached, get_rmapi
 
     client = get_rmapi()
-    items = client.get_meta_items()
+    items = get_meta_items_cached(client)
     items_by_id = get_items_by_id(items)
     documents = [item for item in items if not item.is_folder]
 

@@ -28,6 +28,7 @@ from remarkable_mcp.api import (
     get_item_path,
     get_items_by_id,
     get_items_by_parent,
+    get_meta_items_cached,
     get_rmapi,
 )
 from remarkable_mcp.extract import (
@@ -296,7 +297,7 @@ async def remarkable_read(
     """
     try:
         client = get_rmapi()
-        collection = client.get_meta_items()
+        collection = get_meta_items_cached(client)
         items_by_id = get_items_by_id(collection)
 
         # Validate parameters
@@ -783,7 +784,7 @@ def remarkable_browse(
     """
     try:
         client = get_rmapi()
-        collection = client.get_meta_items()
+        collection = get_meta_items_cached(client)
         items_by_id = get_items_by_id(collection)
         items_by_parent = get_items_by_parent(collection)
 
@@ -1011,7 +1012,7 @@ def remarkable_recent(limit: int = 10, include_preview: bool = False) -> str:
     """
     try:
         client = get_rmapi()
-        collection = client.get_meta_items()
+        collection = get_meta_items_cached(client)
         items_by_id = get_items_by_id(collection)
 
         # Clamp limit - lower max when previews enabled (expensive operation)
@@ -1273,7 +1274,7 @@ def remarkable_status() -> str:
 
     try:
         client = get_rmapi()
-        collection = client.get_meta_items()
+        collection = get_meta_items_cached(client)
         items_by_id = get_items_by_id(collection)
 
         root = _get_root_path()
@@ -1407,7 +1408,7 @@ async def remarkable_image(
             background = get_background_color()
 
         client = get_rmapi()
-        collection = client.get_meta_items()
+        collection = get_meta_items_cached(client)
         items_by_id = get_items_by_id(collection)
 
         root = _get_root_path()

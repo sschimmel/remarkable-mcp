@@ -438,6 +438,23 @@ If only `GOOGLE_VISION_API_KEY` is set (the pre-existing setup), behavior is unc
 
 ---
 
+## Document-tree caching (cloud transport)
+
+On the cloud transport, every tool that needs a document listing (`remarkable_browse`, `remarkable_search`, `remarkable_recent`, `remarkable_read`, `remarkable_status`) calls `client.get_meta_items()`, which fetches the full account tree from reMarkable's API. On heavy accounts that single call can take **25–35 seconds**, and without caching each tool call repeats it from scratch.
+
+The server caches the document tree in-process for a short TTL so subsequent listing calls within the same session are sub-second.
+
+**Env var:**
+- `REMARKABLE_TREE_CACHE_TTL_SECONDS` — TTL in seconds. Default `300` (5 minutes). Set to `0` to disable caching entirely.
+
+**When to disable or shorten:**
+- You're testing changes that affect listing behavior and want fresh data every call.
+- You expect the tablet's contents to change mid-session and need the MCP server to see updates immediately.
+
+The cache applies to all transports (cloud, SSH, USB) but the win is largest for cloud — SSH and USB are already fast enough that caching matters less.
+
+---
+
 ## SSH vs Cloud Comparison
 
 | Feature | SSH Mode | Cloud API |

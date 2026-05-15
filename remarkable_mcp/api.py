@@ -4,6 +4,7 @@ reMarkable Cloud API client helpers.
 
 import json as json_module
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -102,6 +103,85 @@ def register_and_get_token(one_time_code: str) -> str:
         return token_json
     except Exception as e:
         raise RuntimeError(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Document-tree cache
+#
+# Every tool that needs to look up a document (browse, search, read, recent,
+# status) calls client.get_meta_items(), which over the cloud transport
+# fetches the entire account tree from reMarkable's API. On heavy accounts
+# that single call takes 25-35 seconds. Without caching, a Hermes session
+# that touches half a dozen folders spends most of its time waiting on the
+# same listing call.
+#
+# The cache is in-process, TTL-based, and applies uniformly to all
+# transports (cloud / SSH / USB). SSH and USB are already fast so the cache
+# is mostly a no-op for them, but keeping behavior uniform avoids surprises.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_META_CACHE_TTL_SECONDS = 300
+
+_meta_items_cache: Dict[str, Any] = {
+    "items": None,
+    "timestamp": 0.0,
+}
+
+
+def _meta_cache_ttl() -> int:
+    """TTL for the document-tree cache. Overridable via env var.
+
+    Set REMARKABLE_TREE_CACHE_TTL_SECONDS=0 to disable caching entirely.
+    """
+    raw = os.environ.get("REMARKABLE_TREE_CACHE_TTL_SECONDS")
+    if raw is None:
+        return _DEFAULT_META_CACHE_TTL_SECONDS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_META_CACHE_TTL_SECONDS
+
+
+def get_meta_items_cached(client, *, force_refresh: bool = False) -> List[Any]:
+    """Cached wrapper around ``client.get_meta_items()``.
+
+    Caches the full document tree in process memory for
+    ``REMARKABLE_TREE_CACHE_TTL_SECONDS`` (default 300s) to avoid
+    re-fetching from the reMarkable cloud on every tool call. Pass
+    ``force_refresh=True`` to bypass the cache after an operation that
+    is expected to have changed the tree.
+
+    Note: only the no-argument form of ``get_meta_items()`` is cached.
+    Callers that pass ``limit=`` still hit the underlying client directly
+    via ``client.get_meta_items(limit=...)``.
+    """
+    ttl = _meta_cache_ttl()
+    now = time.time()
+    age = now - _meta_items_cache["timestamp"]
+
+    if (
+        not force_refresh
+        and ttl > 0
+        and _meta_items_cache["items"] is not None
+        and age < ttl
+    ):
+        return _meta_items_cache["items"]
+
+    items = client.get_meta_items()
+    _meta_items_cache["items"] = items
+    _meta_items_cache["timestamp"] = now
+    return items
+
+
+def invalidate_meta_items_cache() -> None:
+    """Manually clear the document-tree cache.
+
+    Use after operations the user expects to be reflected immediately
+    (e.g., uploads, deletions). The next listing call refetches from the
+    cloud.
+    """
+    _meta_items_cache["items"] = None
+    _meta_items_cache["timestamp"] = 0.0
 
 
 def get_items_by_id(collection) -> Dict[str, Any]:

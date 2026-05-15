@@ -1845,3 +1845,89 @@ class TestVisionChatCompletionHelper:
                 png_bytes=b"\x89PNG fake",
             )
         assert text is None
+
+
+class TestMetaItemsCache:
+    """Document-tree cache around client.get_meta_items().
+
+    The cloud transport's listing call takes 25-35s on heavy accounts.
+    These tests verify the cache short-circuits repeat calls, honors
+    force_refresh, respects the TTL env var, and can be invalidated.
+    """
+
+    @staticmethod
+    def _reset_cache():
+        from remarkable_mcp.api import invalidate_meta_items_cache
+
+        invalidate_meta_items_cache()
+
+    @staticmethod
+    def _make_client(items):
+        from unittest.mock import Mock
+
+        client = Mock()
+        client.get_meta_items = Mock(return_value=items)
+        return client
+
+    def test_second_call_hits_cache(self):
+        from remarkable_mcp.api import get_meta_items_cached
+
+        self._reset_cache()
+        try:
+            client = self._make_client(items=["doc1", "doc2"])
+            first = get_meta_items_cached(client)
+            second = get_meta_items_cached(client)
+            assert first == ["doc1", "doc2"]
+            assert second == ["doc1", "doc2"]
+            assert client.get_meta_items.call_count == 1
+        finally:
+            self._reset_cache()
+
+    def test_force_refresh_bypasses_cache(self):
+        from remarkable_mcp.api import get_meta_items_cached
+
+        self._reset_cache()
+        try:
+            client = self._make_client(items=["doc1"])
+            get_meta_items_cached(client)
+            get_meta_items_cached(client, force_refresh=True)
+            assert client.get_meta_items.call_count == 2
+        finally:
+            self._reset_cache()
+
+    def test_ttl_zero_disables_cache(self):
+        import os
+
+        from remarkable_mcp.api import get_meta_items_cached
+
+        self._reset_cache()
+        prev = os.environ.get("REMARKABLE_TREE_CACHE_TTL_SECONDS")
+        os.environ["REMARKABLE_TREE_CACHE_TTL_SECONDS"] = "0"
+        try:
+            client = self._make_client(items=["doc1"])
+            get_meta_items_cached(client)
+            get_meta_items_cached(client)
+            get_meta_items_cached(client)
+            assert client.get_meta_items.call_count == 3
+        finally:
+            if prev is None:
+                os.environ.pop("REMARKABLE_TREE_CACHE_TTL_SECONDS", None)
+            else:
+                os.environ["REMARKABLE_TREE_CACHE_TTL_SECONDS"] = prev
+            self._reset_cache()
+
+    def test_invalidate_clears_cache(self):
+        from remarkable_mcp.api import (
+            get_meta_items_cached,
+            invalidate_meta_items_cache,
+        )
+
+        self._reset_cache()
+        try:
+            client = self._make_client(items=["doc1"])
+            get_meta_items_cached(client)
+            invalidate_meta_items_cache()
+            get_meta_items_cached(client)
+            assert client.get_meta_items.call_count == 2
+        finally:
+            self._reset_cache()
