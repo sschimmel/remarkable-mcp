@@ -310,7 +310,9 @@ For handwritten content, remarkable-mcp offers several OCR backends. Choose base
 | Backend | Setup | Quality | Offline | Best For |
 |---------|-------|---------|---------|----------|
 | **Sampling** | No API key | Depends on client model | ✅ | Users with capable AI clients |
-| **Google Vision** | API key | Excellent | ❌ | Best handwriting accuracy |
+| **OpenRouter** | API key | Excellent (model-dependent) | ❌ | Access to Gemini / Claude / GPT / Grok through one billing relationship |
+| **xAI** | API key | Good (Grok Vision) | ❌ | Existing xAI billing; direct connection |
+| **Google Vision** | API key | Excellent | ❌ | Best handwriting accuracy from a specialised OCR service |
 | **Tesseract** | System install | Poor for handwriting | ✅ | Printed text, offline fallback |
 
 ### Quick Setup
@@ -320,12 +322,12 @@ Set `REMARKABLE_OCR_BACKEND` in your MCP config:
 ```json
 {
   "env": {
-    "REMARKABLE_OCR_BACKEND": "sampling"
+    "REMARKABLE_OCR_BACKEND": "openrouter"
   }
 }
 ```
 
-**Options:** `sampling`, `google`, `tesseract`, `auto`
+**Options:** `sampling`, `openrouter`, `xai`, `google`, `tesseract`, `auto`
 
 <details>
 <summary>📖 Sampling OCR (No API Key)</summary>
@@ -340,6 +342,52 @@ Uses your MCP client's AI model for OCR. Works with clients that support MCP sam
 **Cons:**
 - Only available with sampling-capable clients
 - Falls back to Google Vision (if API key configured) or Tesseract if sampling unavailable
+
+</details>
+
+<details>
+<summary>📖 OpenRouter (Gemini / Claude / GPT / Grok via one API)</summary>
+
+Routes OCR through [OpenRouter](https://openrouter.ai), giving you a single billing relationship for any vision-capable model they expose. The default model is `google/gemini-3-pro` (built on the same handwriting tech that powers Google Vision but as a multimodal LLM — strong for Dutch + English handwriting).
+
+**Setup:**
+1. Create an [OpenRouter API key](https://openrouter.ai/keys).
+2. Add to your MCP config:
+   ```json
+   "env": {
+     "REMARKABLE_OCR_BACKEND": "openrouter",
+     "OPENROUTER_API_KEY": "sk-or-v1-...",
+     "OPENROUTER_OCR_MODEL": "google/gemini-3-pro"
+   }
+   ```
+
+**Env vars:**
+- `OPENROUTER_API_KEY` — required.
+- `OPENROUTER_OCR_MODEL` — optional, defaults to `google/gemini-3-pro`. Any vision-capable model OpenRouter exposes works (e.g. `anthropic/claude-sonnet-4.6`, `openai/gpt-5`, `google/gemini-2.5-flash`).
+
+**Cost:** Pay-as-you-go via OpenRouter; varies by model. Gemini Flash tier is cheapest, Gemini Pro / Claude Sonnet for best quality.
+
+</details>
+
+<details>
+<summary>📖 xAI Grok Vision</summary>
+
+Calls [xAI's Grok Vision models](https://docs.x.ai/) directly. Useful if you already have an xAI billing relationship and want to avoid the OpenRouter detour.
+
+**Setup:**
+1. Generate an API key at [x.ai console](https://console.x.ai/).
+2. Add to your MCP config:
+   ```json
+   "env": {
+     "REMARKABLE_OCR_BACKEND": "xai",
+     "XAI_API_KEY": "xai-...",
+     "XAI_OCR_MODEL": "grok-4-vision-beta"
+   }
+   ```
+
+**Env vars:**
+- `XAI_API_KEY` — required.
+- `XAI_OCR_MODEL` — optional, defaults to `grok-4-vision-beta`. Check current model names at https://docs.x.ai/ — Grok's vision lineup changes faster than this README does.
 
 </details>
 
@@ -380,9 +428,13 @@ choco install tesseract
 
 ### Default Behavior (`auto`)
 
-When `REMARKABLE_OCR_BACKEND=auto` (default):
-1. Google Vision (if `GOOGLE_VISION_API_KEY` is set)
-2. Tesseract (fallback)
+When `REMARKABLE_OCR_BACKEND=auto` (default), the backend is chosen by API-key presence in this order:
+1. OpenRouter (if `OPENROUTER_API_KEY` is set)
+2. xAI (if `XAI_API_KEY` is set)
+3. Google Vision (if `GOOGLE_VISION_API_KEY` is set)
+4. Tesseract (fallback)
+
+If only `GOOGLE_VISION_API_KEY` is set (the pre-existing setup), behavior is unchanged from earlier versions.
 
 ---
 

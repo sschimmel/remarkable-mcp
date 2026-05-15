@@ -1099,16 +1099,20 @@ def extract_handwriting_ocr(rm_files: List[Path]) -> tuple[Optional[List[str]], 
 
     Supports multiple backends (set REMARKABLE_OCR_BACKEND env var):
     - "sampling": Uses client's LLM via MCP sampling (requires async context, tools only)
-    - "google": Google Cloud Vision - best for handwriting
-    - "tesseract": pytesseract - basic OCR, requires rmc + cairosvg
-    - "auto" (default): Google if API key provided, else Tesseract
+    - "openrouter": OpenRouter API — access to Gemini, Claude, GPT, Grok via one provider
+    - "xai": xAI direct — Grok Vision models
+    - "google": Google Cloud Vision — excellent for handwriting
+    - "tesseract": pytesseract — basic OCR, requires rmc + cairosvg
+    - "auto" (default): picks the first available backend by API key in order:
+      openrouter > xai > google > tesseract.
 
     Note: "sampling" backend requires async context and is only available via tools,
     not via MCP resources. When sampling is configured but this sync function is called
     (e.g., from resources), it falls back to the auto-detection logic.
 
     Returns:
-        Tuple of (ocr_results, backend_used) where backend_used is "google" or "tesseract"
+        Tuple of (ocr_results, backend_used) where backend_used is one of
+        "openrouter", "xai", "google", or "tesseract".
     """
     import os
 
@@ -1119,20 +1123,201 @@ def extract_handwriting_ocr(rm_files: List[Path]) -> tuple[Optional[List[str]], 
     if backend == "sampling":
         backend = "auto"
 
-    # Auto-detect best available backend
+    # Auto-detect best available backend by API key presence.
+    # Priority: OpenRouter > xAI > Google Vision > Tesseract.
+    # Existing users with only GOOGLE_VISION_API_KEY set keep the previous behavior.
     if backend == "auto":
-        # Check for Google Vision API key first (simplest auth method)
-        if os.environ.get("GOOGLE_VISION_API_KEY"):
+        if os.environ.get("OPENROUTER_API_KEY"):
+            backend = "openrouter"
+        elif os.environ.get("XAI_API_KEY"):
+            backend = "xai"
+        elif os.environ.get("GOOGLE_VISION_API_KEY"):
             backend = "google"
         else:
             backend = "tesseract"
 
-    if backend == "google":
+    if backend == "openrouter":
+        result = _ocr_openrouter(rm_files)
+        return (result, "openrouter")
+    elif backend == "xai":
+        result = _ocr_xai(rm_files)
+        return (result, "xai")
+    elif backend == "google":
         result = _ocr_google_vision(rm_files)
         return (result, "google")
     else:
         result = _ocr_tesseract(rm_files)
         return (result, "tesseract")
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible vision-LLM backends (OpenRouter, xAI)
+#
+# Both providers expose an OpenAI-compatible /v1/chat/completions endpoint
+# that accepts image content. We share a single HTTP helper and one OCR loop
+# between them; only the base_url, auth key, and default model differ.
+# ---------------------------------------------------------------------------
+
+# Prompt sent to the vision LLM for each page. Asks for verbatim transcription
+# without commentary, in either Dutch or English (the languages this user
+# writes in). Other languages will still transcribe but the prompt is biased.
+_VISION_OCR_PROMPT = (
+    "Transcribe the handwritten or printed text from this image exactly as "
+    "written. The text may be in Dutch, English, or a mix of both. Preserve "
+    "line breaks and paragraph structure. Return only the transcribed text "
+    "with no preamble, commentary, or explanation. If the image contains no "
+    "legible text, return an empty response."
+)
+
+
+def _call_vision_chat_completion(
+    base_url: str,
+    api_key: str,
+    model: str,
+    png_bytes: bytes,
+    timeout: int = 120,
+) -> Optional[str]:
+    """
+    Call an OpenAI-compatible /v1/chat/completions endpoint with a PNG image
+    and return the transcribed text.
+
+    Args:
+        base_url: API base URL (e.g. "https://openrouter.ai/api/v1")
+        api_key: Bearer token
+        model: Model identifier (provider-specific, e.g. "google/gemini-3-pro")
+        png_bytes: PNG image content as bytes
+        timeout: HTTP request timeout in seconds
+
+    Returns:
+        Transcribed text (stripped) or None on failure.
+    """
+    import base64
+
+    import requests
+
+    image_b64 = base64.b64encode(png_bytes).decode("utf-8")
+    data_url = f"data:image/png;base64,{image_b64}"
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _VISION_OCR_PROMPT},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ],
+        "max_tokens": 4096,
+        "temperature": 0,
+    }
+
+    response = requests.post(
+        f"{base_url.rstrip('/')}/chat/completions",
+        json=payload,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        timeout=timeout,
+    )
+
+    if response.status_code != 200:
+        return None
+
+    data = response.json()
+    try:
+        text = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+    if not text:
+        return None
+    return text.strip() or None
+
+
+def _ocr_via_vision_chat(
+    rm_files: List[Path],
+    *,
+    base_url: str,
+    api_key: str,
+    model: str,
+    timeout: int = 120,
+) -> Optional[List[str]]:
+    """
+    Shared OCR loop for any OpenAI-compatible vision endpoint.
+
+    Renders each .rm file to a white-background PNG via the existing
+    render_rm_file_to_png helper, then sends it to the chat-completions
+    endpoint and collects the transcription per page.
+    """
+    ocr_results: List[str] = []
+    for rm_file in rm_files:
+        try:
+            png_bytes = render_rm_file_to_png(rm_file, background_color="#FFFFFF")
+            if not png_bytes:
+                continue
+            text = _call_vision_chat_completion(
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                png_bytes=png_bytes,
+                timeout=timeout,
+            )
+            if text:
+                ocr_results.append(text)
+        except Exception:
+            # Skip the page on any rendering or HTTP error; continue.
+            pass
+
+    return ocr_results if ocr_results else None
+
+
+def _ocr_openrouter(rm_files: List[Path]) -> Optional[List[str]]:
+    """
+    OCR via OpenRouter (https://openrouter.ai).
+
+    Env vars:
+      OPENROUTER_API_KEY    — required
+      OPENROUTER_OCR_MODEL  — optional, default "google/gemini-3-pro".
+                              Any vision-capable model OpenRouter exposes works.
+    """
+    import os
+
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        return None
+    model = os.environ.get("OPENROUTER_OCR_MODEL", "google/gemini-3-pro")
+    return _ocr_via_vision_chat(
+        rm_files,
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+        model=model,
+    )
+
+
+def _ocr_xai(rm_files: List[Path]) -> Optional[List[str]]:
+    """
+    OCR via xAI (https://api.x.ai/v1) using a Grok Vision model.
+
+    Env vars:
+      XAI_API_KEY     — required
+      XAI_OCR_MODEL   — optional, default "grok-4-vision-beta".
+                        Check current model names at https://docs.x.ai/.
+    """
+    import os
+
+    api_key = os.environ.get("XAI_API_KEY")
+    if not api_key:
+        return None
+    model = os.environ.get("XAI_OCR_MODEL", "grok-4-vision-beta")
+    return _ocr_via_vision_chat(
+        rm_files,
+        base_url="https://api.x.ai/v1",
+        api_key=api_key,
+        model=model,
+    )
 
 
 def _ocr_google_vision(rm_files: List[Path]) -> Optional[List[str]]:

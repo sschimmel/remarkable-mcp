@@ -1677,3 +1677,171 @@ class TestUSBWebInterface:
                 import remarkable_mcp.api
 
                 importlib.reload(remarkable_mcp.api)
+
+
+class TestExtractHandwritingOCRDispatch:
+    """Backend routing in extract_handwriting_ocr.
+
+    These tests don't make real HTTP calls — they patch the private _ocr_*
+    functions to verify the dispatcher picks the right backend based on
+    REMARKABLE_OCR_BACKEND + which API keys are set.
+    """
+
+    _OCR_ENV_KEYS = (
+        "REMARKABLE_OCR_BACKEND",
+        "OPENROUTER_API_KEY",
+        "XAI_API_KEY",
+        "GOOGLE_VISION_API_KEY",
+    )
+
+    @classmethod
+    def _clean_ocr_env(cls):
+        """Pop OCR-related env vars; return a callable that restores them."""
+        import os
+
+        saved = {k: os.environ.pop(k, None) for k in cls._OCR_ENV_KEYS}
+
+        def restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+        return restore
+
+    def test_auto_prefers_openrouter_over_xai_and_google(self):
+        import os
+        from unittest.mock import patch
+
+        from remarkable_mcp.extract import extract_handwriting_ocr
+
+        restore = self._clean_ocr_env()
+        try:
+            os.environ["OPENROUTER_API_KEY"] = "sk-or-test"
+            os.environ["XAI_API_KEY"] = "xai-test"
+            os.environ["GOOGLE_VISION_API_KEY"] = "AIza-test"
+            with patch(
+                "remarkable_mcp.extract._ocr_openrouter", return_value=["page1"]
+            ):
+                result, backend = extract_handwriting_ocr([])
+            assert backend == "openrouter"
+            assert result == ["page1"]
+        finally:
+            restore()
+
+    def test_auto_picks_xai_when_only_xai_key_set(self):
+        import os
+        from unittest.mock import patch
+
+        from remarkable_mcp.extract import extract_handwriting_ocr
+
+        restore = self._clean_ocr_env()
+        try:
+            os.environ["XAI_API_KEY"] = "xai-test"
+            with patch("remarkable_mcp.extract._ocr_xai", return_value=["page1"]):
+                result, backend = extract_handwriting_ocr([])
+            assert backend == "xai"
+            assert result == ["page1"]
+        finally:
+            restore()
+
+    def test_auto_picks_google_when_only_google_key_set(self):
+        """Backwards-compat: pre-existing setup with only the Google key keeps
+        the Google Vision behavior, unchanged from the prior version."""
+        import os
+        from unittest.mock import patch
+
+        from remarkable_mcp.extract import extract_handwriting_ocr
+
+        restore = self._clean_ocr_env()
+        try:
+            os.environ["GOOGLE_VISION_API_KEY"] = "AIza-test"
+            with patch(
+                "remarkable_mcp.extract._ocr_google_vision", return_value=["page1"]
+            ):
+                result, backend = extract_handwriting_ocr([])
+            assert backend == "google"
+            assert result == ["page1"]
+        finally:
+            restore()
+
+    def test_explicit_backend_overrides_key_based_autodetect(self):
+        """REMARKABLE_OCR_BACKEND=openrouter forces openrouter even when only
+        the Google key is set (the dispatcher trusts the explicit setting)."""
+        import os
+
+        from remarkable_mcp.extract import extract_handwriting_ocr
+
+        restore = self._clean_ocr_env()
+        try:
+            os.environ["REMARKABLE_OCR_BACKEND"] = "openrouter"
+            os.environ["GOOGLE_VISION_API_KEY"] = "AIza-test"
+            # No OPENROUTER_API_KEY — _ocr_openrouter returns None, but the
+            # dispatcher still labels the backend "openrouter" (it tried; the
+            # missing API key is what stopped it).
+            result, backend = extract_handwriting_ocr([])
+            assert backend == "openrouter"
+            assert result is None
+        finally:
+            restore()
+
+
+class TestVisionChatCompletionHelper:
+    """The shared OpenAI-compatible vision helper used by OpenRouter + xAI."""
+
+    def test_parses_text_from_choices(self):
+        from unittest.mock import Mock, patch
+
+        from remarkable_mcp.extract import _call_vision_chat_completion
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "choices": [
+                {"message": {"content": "  Boodschappenlijst:\n- melk\n- brood  "}}
+            ]
+        }
+        with patch("requests.post", return_value=mock_response):
+            text = _call_vision_chat_completion(
+                base_url="https://example.com/v1",
+                api_key="test-key",
+                model="test-model",
+                png_bytes=b"\x89PNG fake",
+            )
+        # Leading/trailing whitespace stripped; inner newlines preserved.
+        assert text == "Boodschappenlijst:\n- melk\n- brood"
+
+    def test_returns_none_on_http_error(self):
+        from unittest.mock import Mock, patch
+
+        from remarkable_mcp.extract import _call_vision_chat_completion
+
+        mock_response = Mock()
+        mock_response.status_code = 401
+        mock_response.json.return_value = {"error": "unauthorized"}
+        with patch("requests.post", return_value=mock_response):
+            text = _call_vision_chat_completion(
+                base_url="https://example.com/v1",
+                api_key="bad-key",
+                model="test-model",
+                png_bytes=b"\x89PNG fake",
+            )
+        assert text is None
+
+    def test_returns_none_when_response_missing_choices(self):
+        from unittest.mock import Mock, patch
+
+        from remarkable_mcp.extract import _call_vision_chat_completion
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"error": "model not found"}
+        with patch("requests.post", return_value=mock_response):
+            text = _call_vision_chat_completion(
+                base_url="https://example.com/v1",
+                api_key="test-key",
+                model="nonexistent-model",
+                png_bytes=b"\x89PNG fake",
+            )
+        assert text is None
