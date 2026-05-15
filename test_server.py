@@ -1931,3 +1931,142 @@ class TestMetaItemsCache:
             assert client.get_meta_items.call_count == 2
         finally:
             self._reset_cache()
+
+
+class TestFetchNotebookCLI:
+    """The `--fetch-notebook PATH` CLI mode.
+
+    Tests _run_fetch_notebook directly (no subprocess) so we can mock
+    the rmapi client + the OCR pipeline cleanly.
+    """
+
+    @staticmethod
+    def _fake_doc(doc_id="doc-1", name="Notes", parent=""):
+        from unittest.mock import Mock
+
+        doc = Mock()
+        doc.ID = doc_id
+        doc.VissibleName = name
+        doc.Parent = parent
+        doc.is_folder = False
+        return doc
+
+    def test_happy_path_emits_expected_json(self, capsys):
+        from unittest.mock import Mock, patch
+
+        from remarkable_mcp.cli import _run_fetch_notebook
+
+        doc = self._fake_doc(doc_id="abc-123", name="Notes")
+        client = Mock()
+        client.download = Mock(return_value=b"PK\x03\x04 fake-zip")
+
+        fake_content = {
+            "typed_text": ["typed line 1"],
+            "highlights": [],
+            "handwritten_text": ["page1 ocr", "page2 ocr"],
+            "pages": 2,
+            "page_ids": ["page-uuid-1", "page-uuid-2"],
+            "ocr_backend": "openrouter",
+            "tags": [],
+        }
+
+        with patch("remarkable_mcp.cli.tempfile.NamedTemporaryFile") as mock_tmp:
+            # Make NamedTemporaryFile return a context manager with a `.name` attribute.
+            tmp_mock = Mock()
+            tmp_mock.name = "/tmp/fake.zip"
+            tmp_mock.__enter__ = Mock(return_value=tmp_mock)
+            tmp_mock.__exit__ = Mock(return_value=False)
+            tmp_mock.write = Mock()
+            mock_tmp.return_value = tmp_mock
+
+            with (
+                patch("remarkable_mcp.api.get_rmapi", return_value=client),
+                patch("remarkable_mcp.api.get_meta_items_cached", return_value=[doc]),
+                patch(
+                    "remarkable_mcp.extract.extract_text_from_document_zip",
+                    return_value=fake_content,
+                ),
+                patch("pathlib.Path.unlink"),
+            ):
+                _run_fetch_notebook("/Notes")
+
+        captured = capsys.readouterr()
+        import json as _json
+
+        payload = _json.loads(captured.out)
+        assert payload["notebook_id"] == "abc-123"
+        assert payload["notebook_path"] == "/Notes"
+        assert payload["pages"] == 2
+        assert payload["page_ids"] == ["page-uuid-1", "page-uuid-2"]
+        assert payload["ocr_text"] == ["page1 ocr", "page2 ocr"]
+        assert payload["ocr_backend"] == "openrouter"
+        assert payload["typed_text"] == ["typed line 1"]
+
+    def test_not_found_raises_with_exit_code_2(self):
+        from unittest.mock import Mock, patch
+
+        import pytest
+
+        from remarkable_mcp.cli import FetchNotebookError, _run_fetch_notebook
+
+        # Empty collection — no notebook matches the path.
+        client = Mock()
+
+        with (
+            patch("remarkable_mcp.api.get_rmapi", return_value=client),
+            patch("remarkable_mcp.api.get_meta_items_cached", return_value=[]),
+        ):
+            with pytest.raises(FetchNotebookError) as excinfo:
+                _run_fetch_notebook("/Does Not Exist")
+
+        assert excinfo.value.error_type == "not_found"
+        assert excinfo.value.exit_code == 2
+
+    def test_handwritten_padded_when_shorter_than_pages(self, capsys):
+        """If OCR returned fewer entries than pages, pad with empty strings
+        so the consumer can index by page_index without IndexError."""
+        from unittest.mock import Mock, patch
+
+        from remarkable_mcp.cli import _run_fetch_notebook
+
+        doc = self._fake_doc()
+        client = Mock()
+        client.download = Mock(return_value=b"PK\x03\x04 fake-zip")
+
+        fake_content = {
+            "typed_text": [],
+            "highlights": [],
+            "handwritten_text": ["only one page got ocr"],  # length 1
+            "pages": 3,  # but document has 3 pages
+            "page_ids": ["a", "b", "c"],
+            "ocr_backend": "openrouter",
+            "tags": [],
+        }
+
+        with patch("remarkable_mcp.cli.tempfile.NamedTemporaryFile") as mock_tmp:
+            tmp_mock = Mock()
+            tmp_mock.name = "/tmp/fake.zip"
+            tmp_mock.__enter__ = Mock(return_value=tmp_mock)
+            tmp_mock.__exit__ = Mock(return_value=False)
+            tmp_mock.write = Mock()
+            mock_tmp.return_value = tmp_mock
+
+            with (
+                patch("remarkable_mcp.api.get_rmapi", return_value=client),
+                patch("remarkable_mcp.api.get_meta_items_cached", return_value=[doc]),
+                patch(
+                    "remarkable_mcp.extract.extract_text_from_document_zip",
+                    return_value=fake_content,
+                ),
+                patch("pathlib.Path.unlink"),
+            ):
+                _run_fetch_notebook("/Notes")
+
+        captured = capsys.readouterr()
+        import json as _json
+
+        payload = _json.loads(captured.out)
+        assert len(payload["ocr_text"]) == 3
+        assert payload["ocr_text"][0] == "only one page got ocr"
+        assert payload["ocr_text"][1] == ""
+        assert payload["ocr_text"][2] == ""

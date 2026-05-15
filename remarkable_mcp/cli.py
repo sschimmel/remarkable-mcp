@@ -11,12 +11,17 @@ Usage:
 
     # Convert one-time code to token (run once)
     remarkable-mcp --register <one-time-code>
+
+    # Fetch one notebook by path and emit JSON (for batch consumers)
+    remarkable-mcp --fetch-notebook "/Notes"
 """
 
 import argparse
 import json
 import os
 import sys
+import tempfile
+from pathlib import Path
 
 
 def main():
@@ -74,8 +79,31 @@ Security Note:
         action="store_true",
         help="Use USB web interface (connect via USB cable, enable in Storage Settings)",
     )
+    parser.add_argument(
+        "--fetch-notebook",
+        metavar="PATH",
+        help=(
+            "Fetch one notebook by path (e.g. '/Notes') and emit JSON on "
+            "stdout with page_ids, per-page OCR text, and the OCR backend "
+            "used. Intended for batch consumers like the LifeOS "
+            "remarkable-poll worker. Honors the same transport and OCR "
+            "env vars as the MCP server."
+        ),
+    )
 
     args = parser.parse_args()
+
+    if args.fetch_notebook:
+        # Batch fetch mode — emit JSON for one notebook and exit.
+        try:
+            _run_fetch_notebook(args.fetch_notebook)
+        except FetchNotebookError as exc:
+            print(json.dumps({"error": str(exc), "type": exc.error_type}), file=sys.stderr)
+            sys.exit(exc.exit_code)
+        except Exception as exc:  # pragma: no cover — defensive
+            print(json.dumps({"error": str(exc), "type": "unexpected"}), file=sys.stderr)
+            sys.exit(1)
+        return
 
     if args.register:
         # Registration mode - convert one-time code to token
@@ -125,6 +153,135 @@ Security Note:
         from remarkable_mcp.server import run
 
         run()
+
+
+class FetchNotebookError(Exception):
+    """Raised by _run_fetch_notebook on a known failure mode.
+
+    Carries a machine-readable ``error_type`` and a non-zero ``exit_code``
+    so batch consumers can branch on the reason cleanly.
+    """
+
+    def __init__(self, message: str, *, error_type: str, exit_code: int = 1):
+        super().__init__(message)
+        self.error_type = error_type
+        self.exit_code = exit_code
+
+
+def _run_fetch_notebook(notebook_path: str) -> None:
+    """Fetch one notebook by path, run OCR, and print JSON to stdout.
+
+    Output shape (success):
+        {
+          "notebook_id":   "<rM doc UUID>",
+          "notebook_path": "/Notes",
+          "pages":         N,
+          "page_ids":      ["uuid", ...],
+          "ocr_text":      ["text per page or empty string", ...],
+          "ocr_backend":   "openrouter" | "google" | "xai" | "tesseract" | null,
+          "typed_text":    [...]  # from rmscene parsing, may be empty
+        }
+
+    Raises ``FetchNotebookError`` on known failure modes.
+    """
+    # Imports are deferred so the CLI's --help and --register paths don't
+    # pull in the heavy stack.
+    from remarkable_mcp.api import (
+        get_item_path,
+        get_items_by_id,
+        get_meta_items_cached,
+        get_rmapi,
+    )
+    from remarkable_mcp.extract import extract_text_from_document_zip
+
+    try:
+        client = get_rmapi()
+    except Exception as exc:
+        raise FetchNotebookError(
+            f"Failed to initialise reMarkable client: {exc}",
+            error_type="client_init_failed",
+        )
+
+    try:
+        collection = get_meta_items_cached(client)
+    except Exception as exc:
+        raise FetchNotebookError(
+            f"Failed to list documents: {exc}",
+            error_type="list_failed",
+        )
+
+    items_by_id = get_items_by_id(collection)
+    documents = [item for item in collection if not item.is_folder]
+
+    # Match by name (case-insensitive) or by full path (case-insensitive).
+    needle = notebook_path.lower().strip("/")
+    target_doc = None
+    for doc in documents:
+        if doc.VissibleName.lower() == needle:
+            target_doc = doc
+            break
+        if get_item_path(doc, items_by_id).lower().strip("/") == needle:
+            target_doc = doc
+            break
+
+    if target_doc is None:
+        raise FetchNotebookError(
+            f"Notebook not found: {notebook_path!r}",
+            error_type="not_found",
+            exit_code=2,
+        )
+
+    resolved_path = get_item_path(target_doc, items_by_id)
+
+    try:
+        raw_zip = client.download(target_doc)
+    except Exception as exc:
+        raise FetchNotebookError(
+            f"Failed to download notebook: {exc}",
+            error_type="download_failed",
+        )
+
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            tmp.write(raw_zip)
+            tmp_path = Path(tmp.name)
+        try:
+            content = extract_text_from_document_zip(
+                tmp_path,
+                include_ocr=True,
+                doc_id=target_doc.ID,
+            )
+        except Exception as exc:
+            raise FetchNotebookError(
+                f"Failed to extract content: {exc}",
+                error_type="extract_failed",
+            )
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+    handwritten = content.get("handwritten_text") or []
+    page_ids = content.get("page_ids") or []
+    pages = content.get("pages") or len(page_ids)
+
+    # Normalise handwritten_text to length == pages so the consumer can
+    # index by page_index reliably even if OCR returned empty for some
+    # pages.
+    if len(handwritten) < pages:
+        handwritten = list(handwritten) + [""] * (pages - len(handwritten))
+
+    payload = {
+        "notebook_id": target_doc.ID,
+        "notebook_path": resolved_path,
+        "pages": pages,
+        "page_ids": page_ids,
+        "ocr_text": handwritten,
+        "ocr_backend": content.get("ocr_backend"),
+        "typed_text": content.get("typed_text") or [],
+    }
+
+    print(json.dumps(payload, ensure_ascii=False))
 
 
 if __name__ == "__main__":

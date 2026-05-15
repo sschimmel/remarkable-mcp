@@ -438,6 +438,41 @@ If only `GOOGLE_VISION_API_KEY` is set (the pre-existing setup), behavior is unc
 
 ---
 
+## Batch CLI: `--fetch-notebook`
+
+For non-agent consumers that want one notebook's content as JSON without speaking the MCP protocol, the CLI exposes a one-shot fetch mode:
+
+```bash
+remarkable-mcp --fetch-notebook "/Notes" > notes.json
+```
+
+Honors the same transport env vars (`REMARKABLE_USE_USB_WEB`, `REMARKABLE_USE_SSH`, or the cloud `REMARKABLE_TOKEN`) and the same OCR env vars (`REMARKABLE_OCR_BACKEND`, `OPENROUTER_API_KEY`, etc.) as the MCP server itself.
+
+**Output shape:**
+
+```json
+{
+  "notebook_id":   "<rM doc UUID>",
+  "notebook_path": "/Notes",
+  "pages":         3,
+  "page_ids":      ["page-uuid-1", "page-uuid-2", "page-uuid-3"],
+  "ocr_text":      ["page 1 text", "page 2 text", ""],
+  "ocr_backend":   "openrouter",
+  "typed_text":    []
+}
+```
+
+`ocr_text` is always padded to `pages` length — an empty string means OCR returned nothing for that page (illegible, blank, or OCR failure).
+
+**Exit codes:**
+- `0` — success, JSON on stdout.
+- `2` — notebook not found at the given path; structured error JSON on stderr.
+- `1` — any other failure (auth, network, OCR setup); structured error JSON on stderr.
+
+Intended for scripted callers that fetch a notebook on a schedule (e.g. the LifeOS reMarkable watcher, which polls nightly).
+
+---
+
 ## Document-tree caching (cloud transport)
 
 On the cloud transport, every tool that needs a document listing (`remarkable_browse`, `remarkable_search`, `remarkable_recent`, `remarkable_read`, `remarkable_status`) calls `client.get_meta_items()`, which fetches the full account tree from reMarkable's API. On heavy accounts that single call can take **25–35 seconds**, and without caching each tool call repeats it from scratch.
